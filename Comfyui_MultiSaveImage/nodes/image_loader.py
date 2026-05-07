@@ -1,0 +1,268 @@
+import hashlib
+import io
+import os
+from typing import Optional
+from urllib.parse import urlparse
+
+import numpy as np
+import requests
+import torch
+from PIL import Image, ImageOps
+
+import folder_paths
+
+
+class ImageLoader:
+    """
+    Hybrid image loader that mirrors ComfyUI's Load Image node while adding URL download support.
+    """
+
+    URL_DOWNLOAD_SUBDIR = "meux_downloads"
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "load_image"
+    CATEGORY = "image"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        # Mirror native Load Image: list input dir manually and filter to images.
+        try:
+            input_dir = folder_paths.get_input_directory()
+            files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+            if hasattr(folder_paths, "filter_files_content_types"):
+                files = folder_paths.filter_files_content_types(files, ["image"])
+            input_files = sorted(files) or [""]
+        except Exception:
+            print("[MeuxImageLoader] WARN: 无法访问 input 目录，本地文件选择已禁用。")
+            input_files = [""]
+        return {
+            "required": {
+                "source_type": (["local", "url"], {"default": "local"}),
+                # 设为必填以确保上传按钮显示，同时默认值为空字符串，配合 VALIDATE_INPUTS 控制模式校验
+                "image": (input_files, {"default": "", "image_upload": True}),
+            },
+            "optional": {
+                "image_url": ("STRING", {"default": ""}),
+                "filename_hint": ("STRING", {"default": ""}),
+                "persist_to_input": ("BOOLEAN", {"default": True}),
+                "overwrite_existing": ("BOOLEAN", {"default": False}),
+                "download_timeout": ("FLOAT", {"default": 10.0, "min": 1.0, "max": 120.0}),
+                "max_download_mb": ("FLOAT", {"default": 20.0, "min": 1.0, "max": 200.0}),
+                "verify_ssl": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, source_type, image=None, image_url="", **kwargs):
+        # Enforce mutually exclusive requirements for clarity.
+        if source_type == "local":
+            if not image or str(image).strip() == "":
+                return "请选择本地图片文件。"
+        elif source_type == "url":
+            if not image_url.strip():
+                return "请输入有效的图片 URL。"
+        return True
+
+    def load_image(
+        self,
+        source_type="local",
+        image=None,
+        image_url="",
+        filename_hint="",
+        persist_to_input=True,
+        overwrite_existing=False,
+        download_timeout=10.0,
+        max_download_mb=20.0,
+        verify_ssl=True,
+    ):
+        if source_type == "local":
+            pil_image = self._load_local_image(image)
+        elif source_type == "url":
+            pil_image = self._load_url_image(
+                image_url=image_url,
+                timeout=download_timeout,
+                max_bytes=int(max_download_mb * 1024 * 1024),
+                verify_ssl=verify_ssl,
+            )
+            if persist_to_input:
+                self._persist_image(
+                    pil_image,
+                    filename_hint=filename_hint,
+                    url=image_url,
+                    overwrite=overwrite_existing,
+                )
+        else:
+            raise ValueError(f"未知 source_type: {source_type}")
+
+        image_tensor, mask_tensor = self._pil_to_tensors(pil_image)
+        return (image_tensor, mask_tensor)
+
+    def _load_local_image(self, image_name: Optional[str]) -> Image.Image:
+        if not image_name:
+            raise ValueError("未指定要加载的本地图片文件。")
+
+        try:
+            input_dir = folder_paths.get_input_directory()
+        except KeyError:
+            raise ValueError("未检测到 ComfyUI 的 input 目录，请在根目录创建 input 文件夹后重启。")
+        full_path = os.path.abspath(os.path.join(input_dir, image_name))
+        if not (full_path.startswith(os.path.abspath(input_dir) + os.sep) or full_path == os.path.abspath(input_dir)):
+            raise ValueError("无效的图片路径。")
+
+        if not os.path.isfile(full_path):
+            raise FileNotFoundError(f"找不到图片：{image_name}")
+
+        image = Image.open(full_path)
+        image = ImageOps.exif_transpose(image)
+        return image
+
+    def _load_url_image(self, image_url: str, timeout: float, max_bytes: int, verify_ssl: bool) -> Image.Image:
+        if not image_url:
+            raise ValueError("请提供有效的图片 URL。")
+
+        url = image_url.strip()
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValueError("只支持 HTTP/HTTPS 图片 URL。")
+
+        buffer = io.BytesIO()
+        with requests.get(url, timeout=timeout, stream=True, verify=verify_ssl) as response:
+            response.raise_for_status()
+
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                buffer.write(chunk)
+                if buffer.tell() > max_bytes:
+                    raise ValueError(f"图片超过限制：{max_bytes / (1024 * 1024):.1f} MB")
+
+        buffer.seek(0)
+        raw_bytes = buffer.getvalue()
+        image = Image.open(io.BytesIO(raw_bytes))
+        image = ImageOps.exif_transpose(image)
+        # Keep original bytes so persistence can avoid recompressing (preserves file size/quality).
+        image._meux_raw_bytes = raw_bytes
+        return image
+
+    def _pil_to_tensors(self, image: Image.Image):
+        original_mode = image.mode
+
+        if image.mode in {"I", "F"}:
+            image = image.convert("RGB")
+        elif image.mode == "P":
+            image = image.convert("RGBA")
+
+        mask_tensor = None
+
+        if image.mode == "RGBA":
+            mask_tensor = self._mask_from_channel(image.getchannel("A"))
+            image = image.convert("RGB")
+        elif image.mode == "LA":
+            mask_tensor = self._mask_from_channel(image.getchannel("A"))
+            image = image.convert("RGB")
+        elif image.mode == "L":
+            mask_tensor = self._mask_from_channel(image)
+            image = image.convert("RGB")
+        else:
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+
+        np_image = np.array(image).astype(np.float32) / 255.0
+        image_tensor = torch.from_numpy(np_image)[None, ...]
+
+        if mask_tensor is None:
+            mask_tensor = torch.zeros((1, image_tensor.shape[1], image_tensor.shape[2], 1), dtype=torch.float32)
+
+        print(f"[MeuxImageLoader] mode={original_mode} -> tensor shape={tuple(image_tensor.shape)}")
+        return image_tensor, mask_tensor
+
+    def _mask_from_channel(self, channel: Image.Image) -> torch.Tensor:
+        array = np.array(channel).astype(np.float32) / 255.0
+        mask = torch.from_numpy(array)[None, ..., None]
+        return mask
+
+    def _persist_image(self, image: Image.Image, filename_hint: str, url: str, overwrite: bool):
+        input_dir = self._get_input_directory()
+        persist_dir = self._get_url_persist_directory(create=True)
+        extension = self._infer_extension(image, url)
+        filename = self._build_cached_filename(filename_hint, extension, url)
+        full_path = os.path.abspath(os.path.join(persist_dir, filename))
+        persist_dir_abs = os.path.abspath(persist_dir)
+        if not (full_path.startswith(persist_dir_abs + os.sep) or full_path == persist_dir_abs):
+            raise ValueError("无法写入到 URL 下载缓存目录之外。")
+
+        if os.path.exists(full_path) and not overwrite:
+            stem, ext = os.path.splitext(filename)
+            counter = 1
+            while True:
+                candidate = f"{stem}_{counter}{ext}"
+                candidate_path = os.path.join(persist_dir, candidate)
+                if not os.path.exists(candidate_path):
+                    full_path = candidate_path
+                    break
+                counter += 1
+
+        raw_bytes = getattr(image, "_meux_raw_bytes", None)
+        if raw_bytes is not None:
+            with open(full_path, "wb") as f:
+                f.write(raw_bytes)
+        else:
+            image.save(full_path)
+        print(f"[MeuxImageLoader] 已保存到 {os.path.relpath(full_path, input_dir)}")
+        return full_path
+
+    def _build_cached_filename(self, filename_hint: str, extension: str, url: str) -> str:
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+        path_name = os.path.basename(urlparse(url).path)
+        label_source = filename_hint or path_name or ""
+        label = self._sanitize_filename(label_source)
+        if label.endswith(extension):
+            label = label[: -len(extension)]
+        if label:
+            return f"meux_url_{digest}__{label}{extension}"
+        return f"meux_url_{digest}{extension}"
+
+    def _get_input_directory(self) -> str:
+        try:
+            return folder_paths.get_input_directory()
+        except KeyError:
+            raise ValueError("未检测到 ComfyUI 的 input 目录，请在根目录创建 input 文件夹后重启。")
+
+    def _get_url_persist_directory(self, create: bool) -> str:
+        input_dir = self._get_input_directory()
+        persist_dir = os.path.join(input_dir, self.URL_DOWNLOAD_SUBDIR)
+        if create:
+            os.makedirs(persist_dir, exist_ok=True)
+        return persist_dir
+
+    def _infer_extension(self, image: Image.Image, url: str) -> str:
+        parsed = urlparse(url)
+        path = parsed.path or ""
+        ext = os.path.splitext(path)[1].lower()
+        if ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            return ext
+
+        if image.format:
+            format_map = {
+                "PNG": ".png",
+                "JPEG": ".jpg",
+                "JPG": ".jpg",
+                "WEBP": ".webp",
+                "BMP": ".bmp",
+            }
+            if image.format.upper() in format_map:
+                return format_map[image.format.upper()]
+
+        return ".png"
+
+    def _sanitize_filename(self, name: str) -> str:
+        dangerous_chars = ["..", "/", "\\", ":"]
+        sanitized = name
+        for char in dangerous_chars:
+            sanitized = sanitized.replace(char, "_")
+
+        sanitized = sanitized.strip().strip(".")
+        return sanitized[:100] if sanitized else ""
+
+
+__all__ = ["ImageLoader"]
